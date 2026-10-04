@@ -2864,6 +2864,161 @@ class TestSystemdCgroupIsolation:
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
 
 
+# =========================================================================
+# Supervised serve/dashboard backends get the gateway's scope isolation (#132358)
+# =========================================================================
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: systemd scopes")
+class TestSupervisedServeBackendScoping:
+    """A supervised ``hermes serve`` / ``hermes dashboard`` backend hosts agent turns for
+    remote clients without the messaging gateway's identity, so ``_is_supervised_gateway_process()``
+    is False and its background workers used to share the backend's own cgroup: a descendant that
+    ``setsid()``s survived the kill untracked while holding the PTY slave open, and the backend
+    missed the OOM isolation the scope gives the gateway (#70716). It must get the same per-worker
+    scope the supervised gateway gets (#132358); terminal children that merely inherit the
+    launcher markers must stay unscoped.
+    """
+
+    def _patch_scope_helpers(self, monkeypatch):
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(
+            "tools.process_registry._systemd_run_user_scope_available",
+            lambda: True,
+        )
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/systemd-run")
+
+    def _fake_popen_capture(self):
+        captured = {}
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = list(argv)
+            captured["start_new_session"] = kwargs.get("start_new_session")
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        return fake_popen, captured
+
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize(
+        "argv_tail",
+        [
+            ["serve", "--port", "9119"],
+            ["dashboard"],
+            # The Desktop client's SSH backend spawn (hermes_cli._startup_fast docstring).
+            ["serve", "--ssh-session-token-file", "/tmp/hermes-ssh-token"],
+        ],
+        ids=["serve", "dashboard", "desktop-ssh-backend"],
+    )
+    def test_supervised_serve_backend_wraps_in_scope(
+        self, registry, monkeypatch, argv_tail
+    ):
+        """A service-manager-hosted serve/dashboard backend scopes its background workers,
+        so the kill reaps ``setsid()`` escapees via the scope stop and a worker OOM cannot
+        take the backend down."""
+        monkeypatch.setattr(sys, "argv", ["hermes"] + argv_tail)
+        monkeypatch.setattr(
+            "gateway.restart.is_supervised_gateway_launch",
+            lambda environ=None: True,
+        )
+        self._patch_scope_helpers(monkeypatch)
+        fake_popen, captured = self._fake_popen_capture()
+
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+        ):
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+
+        argv = captured["argv"]
+        assert argv[0] == "/usr/bin/systemd-run", argv
+        assert "--scope" in argv
+        unit_idx = argv.index("--unit")
+        assert argv[unit_idx + 1] == f"hermes-worker-{session.id}", argv
+        assert session.systemd_unit == f"hermes-worker-{session.id}.scope"
+        assert captured["start_new_session"] is True
+
+    @pytest.mark.platforms("linux")
+    def test_unsupervised_serve_backend_does_not_wrap(self, registry, monkeypatch):
+        """A hand-run ``hermes serve`` (no service manager, no launcher marker) keeps the
+        legacy path — scoping is a supervised-backend concern, like the gateway's."""
+        monkeypatch.setattr(sys, "argv", ["hermes", "serve", "--port", "9119"])
+        monkeypatch.setattr(
+            "gateway.restart.is_supervised_gateway_launch",
+            lambda environ=None: False,
+        )
+        self._patch_scope_helpers(monkeypatch)
+        fake_popen, captured = self._fake_popen_capture()
+
+        with (
+            patch("subprocess.Popen", side_effect=fake_popen),
+            patch("threading.Thread", return_value=MagicMock()),
+            patch.object(registry, "_write_checkpoint"),
+        ):
+            registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert captured["argv"] == ["/bin/bash", "-lic", "set +m; echo hello"], captured
+
+    @pytest.mark.platforms("linux")
+    @pytest.mark.parametrize("use_pty", [False, True])
+    def test_inherited_markers_do_not_scope_non_serve_children(
+        self, registry, monkeypatch, use_pty
+    ):
+        """A terminal child that inherits the launcher markers but is not a serve/dashboard
+        process stays unscoped by the backend rule (the gateway rule still needs PID-file
+        ownership, which it does not have here)."""
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
+        monkeypatch.setattr(
+            "gateway.restart.is_supervised_gateway_launch",
+            lambda environ=None: True,
+        )
+        self._patch_scope_helpers(monkeypatch)
+
+        if use_pty:
+            from ptyprocess import PtyProcess
+
+            fake_pty = MagicMock(pid=4321)
+            with (
+                patch.object(PtyProcess, "spawn", return_value=fake_pty) as pty_spawn,
+                patch("threading.Thread", return_value=MagicMock()),
+                patch.object(registry, "_write_checkpoint"),
+            ):
+                session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
+            assert pty_spawn.call_args.args[0] == [
+                "/bin/bash", "-lic", "set +m; codex",
+            ]
+        else:
+            fake_popen, captured = self._fake_popen_capture()
+            with (
+                patch("subprocess.Popen", side_effect=fake_popen),
+                patch("threading.Thread", return_value=MagicMock()),
+                patch.object(registry, "_write_checkpoint"),
+            ):
+                session = registry.spawn_local("echo hello", cwd="/tmp")
+            assert captured["argv"] == [
+                "/bin/bash", "-lic", "set +m; echo hello",
+            ]
+
+        assert session.systemd_unit == ""
+
+    def test_serve_backend_predicate_rejects_other_argv(self, monkeypatch):
+        """The predicate itself keys on the serve/dashboard/Desktop-SSH argv identity."""
+        import tools.process_registry as pr
+
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
+        monkeypatch.setattr(
+            "gateway.restart.is_supervised_gateway_launch",
+            lambda environ=None: True,
+        )
+        assert pr._is_supervised_serve_backend_process() is False
+
+        monkeypatch.setattr(sys, "argv", ["hermes", "serve"])
+        assert pr._is_supervised_serve_backend_process() is True
+
+
 
 
 class TestNotificationRedaction:

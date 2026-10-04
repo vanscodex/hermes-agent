@@ -14,6 +14,7 @@ import shlex
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -303,6 +304,45 @@ def _is_supervised_gateway_process() -> bool:
         return is_supervised_gateway_launch() and get_running_pid(cleanup_stale=False) == os.getpid()
     except Exception as exc:
         logger.debug("Could not verify supervised gateway process identity: %s", exc)
+        return False
+
+
+def _argv_names_dashboard_backend(argv: List[str]) -> bool:
+    """Whether *argv* is a ``hermes serve`` / ``hermes dashboard`` backend invocation — the
+    same token scan ``hermes_cli.dashboard_procs._dashboard_subcommand_index`` uses to identify
+    those processes."""
+    return any(tok in ("serve", "dashboard") for tok in argv)
+
+
+def _is_supervised_serve_backend_process() -> bool:
+    """Whether this process is a supervised ``hermes serve`` / ``hermes dashboard`` backend
+    hosting agent turns for remote clients (#132358).
+
+    Such a backend is NOT the messaging gateway: it never sets ``_HERMES_GATEWAY`` and does not
+    own the gateway PID file, so :func:`_is_supervised_gateway_process` is False and its
+    background processes used to share the backend's own cgroup. A descendant that ``setsid()``s
+    then survives the kill untracked while holding the PTY slave open, and the backend misses
+    the OOM isolation the scope gives the gateway (#70716).
+
+    Eligibility keeps the launcher-marker proof (:func:`gateway.restart.is_supervised_gateway_launch`
+    — systemd ``INVOCATION_ID``, launchd, s6, ``HERMES_SUPERVISED_CHILD``, ``--external-supervisor``)
+    but drops the messaging-gateway PID-file check, restricted to actual serve/dashboard processes
+    so terminal children that merely inherit the markers stay unscoped. Self-kill and lifecycle
+    guards keep using the stricter :func:`_is_supervised_gateway_process` identity.
+    """
+    if not _IS_LINUX:
+        return False
+    try:
+        from hermes_cli._startup_fast import is_desktop_ssh_backend_argv
+
+        argv = list(sys.argv[1:])
+        if not (is_desktop_ssh_backend_argv(argv) or _argv_names_dashboard_backend(argv)):
+            return False
+        from gateway.restart import is_supervised_gateway_launch
+
+        return is_supervised_gateway_launch()
+    except Exception as exc:
+        logger.debug("Could not verify supervised serve-backend identity: %s", exc)
         return False
 
 
@@ -1220,11 +1260,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _scope_argv(self, session: ProcessSession, safe_command: str, unit_suffix: str, label: str) -> List[str]:
         """Login-shell argv for *safe_command* (parity with LocalEnvironment: rc files
         sourced, user tools on PATH), wrapped in a transient systemd scope when we are
-        the supervised gateway (own cgroup: an OOM kills only the worker, not the
-        gateway and its messaging control plane)."""
+        the supervised gateway or a supervised serve/dashboard backend (own cgroup: an
+        OOM kills only the worker, not the backend and its control plane; the scope stop
+        also reaps ``setsid()`` escapees the PID kill cannot reach — #132358)."""
         argv = [_find_shell(), "-lic", f"set +m; {safe_command}"]
-        # This applies to both pipe mode and the PTY path above. See #70716.
-        in_supervised_gateway = _IS_LINUX and _is_supervised_gateway_process()
+        # This applies to both pipe mode and the PTY path above. See #70716, #132358.
+        in_supervised_gateway = _IS_LINUX and (
+            _is_supervised_gateway_process() or _is_supervised_serve_backend_process())
         if in_supervised_gateway and _systemd_run_user_scope_available():
             session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             return _build_systemd_scope_argv(argv, unit_suffix=unit_suffix)
