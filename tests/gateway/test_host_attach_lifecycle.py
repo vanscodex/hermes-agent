@@ -313,3 +313,47 @@ def test_another_tenants_host_gateway_never_yields_attach_or_the_lock_refusal(tm
     monkeypatch.setattr("gateway.control_socket.rescan_gateway_profiles",
                         lambda *a, **k: pytest.fail("B must not ask A's gateway to rescan"))
     gateway_run._claim_host_gateway_role()  # no SystemExit(75)
+
+
+def test_a_record_naming_our_own_pid_never_dials(tmp_path, monkeypatch):
+    """#132547: the gateway asks about its own host role from its own event loop (the multiplex
+    profile reconcile → live_gateway_pid_for_home → _host_gateway_serves_home). The record's PID
+    is OURS, so the only process that could answer the dial is the one blocked inside it — on
+    Windows the named-pipe client read has no kernel timeout, so the loop wedged until the
+    shutdown watchdog killed the gateway (exit 75). The self-case must answer ``identify``
+    locally, never dial."""
+    home = tmp_path / "root"
+    _publish(os.getpid(), home, ("default", "coder"))
+
+    def _no_dial(*a, **k):
+        raise AssertionError("the host gateway must not dial its own control socket")
+
+    monkeypatch.setattr("gateway.control_socket.identify_gateway", _no_dial)
+    monkeypatch.setattr(
+        "gateway.control_socket.build_identify_payload",
+        lambda: {"pid": os.getpid(), "hermes_home": str(home), "served_profiles": ["default", "coder"]})
+
+    owner = host_attach._probe_host_gateway(0.0)
+
+    assert owner is not None and owner.pid == os.getpid()
+    assert owner.served_known is True
+    assert owner.serves("coder") and owner.serves("default")
+    assert not owner.serves("other")
+
+
+def test_a_self_record_with_a_mismatched_identity_falls_back_to_the_dial(tmp_path, monkeypatch, owner_pid):
+    """The local answer goes through the same verification as a dialled one: a record naming our
+    PID but a home our identity disagrees with (stale record from a moved install) must fall
+    through to the bounded dial path, not be trusted."""
+    home = tmp_path / "root"
+    _publish(os.getpid(), home, ())
+    # The local identify names a DIFFERENT home than the record claims → mismatch → dial.
+    monkeypatch.setattr(
+        "gateway.control_socket.build_identify_payload",
+        lambda: {"pid": os.getpid(), "hermes_home": str(tmp_path / "elsewhere"), "served_profiles": ["x"]})
+    _answer_identify(monkeypatch, os.getpid(), home, ["default"])
+
+    owner = host_attach._probe_host_gateway(0.0)
+
+    assert owner is not None and owner.served_known is True
+    assert owner.serves("default")

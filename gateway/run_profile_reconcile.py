@@ -108,12 +108,20 @@ class GatewayProfileReconcileMixin:
             known = dict(self._served_profile_homes or {})
             from gateway.status import live_gateway_pid_for_home
 
+            # ``live_gateway_pid_for_home`` can dial another home's control socket, and its
+            # client read is not deadline-safe on every transport (Windows named pipes had no
+            # kernel timeout — #132547). This watcher runs ON the loop that drives every
+            # platform adapter, so one stalled dial would miss the liveness probes and the
+            # shutdown watchdog would kill the whole multiplexer (exit 75). Same class of fix
+            # as the #105279 off-loop move: the call is sync and stateless, so park it on the
+            # default executor and degrade a stall to a skipped cycle instead of a dead loop.
+            loop = asyncio.get_running_loop()
             blocked = set()
             warned = self._profile_own_gateway_warned or set()
             for name in list(current):
                 if name == active or name in known:
                     continue
-                if live_gateway_pid_for_home(current[name]) is not None:
+                if await loop.run_in_executor(None, live_gateway_pid_for_home, current[name]) is not None:
                     blocked.add(name)
                     if name not in warned:
                         logger.warning("[MULTIPLEX] Profile '%s' still runs its own gateway; "

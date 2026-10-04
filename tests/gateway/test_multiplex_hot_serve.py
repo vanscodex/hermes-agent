@@ -379,3 +379,35 @@ async def test_hot_added_profile_cannot_double_claim_a_live_secondary_token(tmp_
         await runner.reconcile_served_profiles()
     fp = GatewayRunner._adapter_credential_fingerprint(_Adapter("shared"))
     assert seen_claims["dupe"].get((Platform.DISCORD, fp)) == "alpha"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_probes_peer_gateways_off_the_event_loop(tmp_path, monkeypatch):
+    """#132547: the reconcile watcher runs ON the loop that drives every platform adapter, and
+    ``live_gateway_pid_for_home`` can dial another home's control socket — a stalled dial there
+    (Windows named-pipe reads had no kernel timeout) starved the liveness probes until the
+    shutdown watchdog killed the whole multiplexer (exit 75). The probe must run on the default
+    executor, same class of fix as the #105279 off-loop move."""
+    import threading
+
+    runner, home = _runner(tmp_path, monkeypatch)
+    _mkprofile(home, "solo", "DISCORD_BOT_TOKEN=solo-token\n")
+    probe_threads = []
+
+    def _probe(h):
+        probe_threads.append(threading.current_thread())
+        return None
+
+    monkeypatch.setattr("gateway.status.live_gateway_pid_for_home", _probe)
+    loop = asyncio.get_running_loop()
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        await runner._start_secondary_profile_adapters()
+        (home / "profiles" / "late").mkdir(parents=True)
+        (home / "profiles" / "late" / "config.yaml").write_text("model: {default: m}\n", encoding="utf-8")
+        (home / "profiles" / "late" / ".env").write_text("DISCORD_BOT_TOKEN=late\n", encoding="utf-8")
+        await runner.reconcile_served_profiles()
+
+    assert probe_threads, "the reconcile never probed the new profile's home"
+    loop_thread = threading.current_thread()
+    assert all(t is not loop_thread for t in probe_threads), (
+        "live_gateway_pid_for_home ran on the event loop thread")

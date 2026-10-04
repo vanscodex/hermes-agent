@@ -19,6 +19,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -315,7 +316,10 @@ def _query_unix_socket(home: Path, request: bytes, timeout: float) -> Optional[b
     return None
 
 
-def _query_windows_pipe(home: Path, request: bytes, timeout: float) -> Optional[bytes]:  # pragma: no cover - wine2e lane
+def _pipe_exchange(home: Path, request: bytes, timeout: float, out: list) -> None:  # pragma: no cover - wine2e lane
+    """The blocking half of :func:`_query_windows_pipe`: connect (with a bounded busy-retry
+    window), write the request, read the response. Runs in a helper thread so a server that
+    never answers cannot wedge the caller — see :func:`_query_windows_pipe`."""
     pipe_name = windows_pipe_name(home)
     deadline = time.monotonic() + timeout
     handle = None
@@ -323,18 +327,41 @@ def _query_windows_pipe(home: Path, request: bytes, timeout: float) -> Optional[
         try:
             handle = open(pipe_name, "r+b", buffering=0)
         except FileNotFoundError:
-            return None
+            return
         except OSError:
             # Pipe busy (another client mid-handshake) — brief retry window.
             if time.monotonic() >= deadline:
-                return None
+                return
             time.sleep(0.05)
     try:
         handle.write(request)
-        return _read_response_line(lambda: handle.read(65536), deadline)
+        out[0] = _read_response_line(lambda: handle.read(65536), deadline)
     finally:
         with contextlib.suppress(Exception):
             handle.close()
+
+
+def _query_windows_pipe(home: Path, request: bytes, timeout: float) -> Optional[bytes]:  # pragma: no cover - wine2e lane
+    """One-shot exchange with the Windows named pipe, bounded by *timeout* end to end.
+
+    The pipe client has NO kernel read timeout: ``handle.read()`` blocks until the server
+    writes, and the deadline in :func:`_read_response_line` is only checked between reads —
+    a server that never answers stalled the caller forever (#132547: the multiplexer dialed
+    its own pipe from its event loop, so the only process that could answer was the one
+    blocked in this read, and the shutdown watchdog killed the gateway). The exchange now
+    runs in a daemon helper thread the caller abandons at the deadline: one stalled query
+    degrades to ``None`` (callers fall back to the scan layer) instead of an unbounded wedge.
+    """
+    out: list = [None]
+    worker = threading.Thread(
+        target=_pipe_exchange, args=(home, request, timeout, out), daemon=True,
+        name="hermes-control-pipe-client")
+    worker.start()
+    # The exchange's own deadline bounds the retry window; the read can still hang past it,
+    # so join() is the hard stop: past this, the result is None and the (daemon) worker is
+    # abandoned — it dies when the pipe finally closes or at interpreter exit.
+    worker.join(timeout + 0.5)
+    return out[0]
 
 
 def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:

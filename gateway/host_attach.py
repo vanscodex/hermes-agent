@@ -130,6 +130,18 @@ def launched_by_other_tenant(owner_home: Path | str, our_home: Path | str) -> bo
                                  get_default_hermes_root(home=our_home))
 
 
+def _local_identify() -> Optional[dict]:
+    """The ``identify`` answer for THIS process, built the same way the control server builds it —
+    no dial, no socket, no loop yield. Only meaningful when the host record names this process."""
+    try:
+        from gateway.control_socket import build_identify_payload
+
+        return build_identify_payload()
+    except Exception:
+        logger.debug("local identify failed", exc_info=True)
+        return None
+
+
 def _identify(home: Path) -> Optional[dict]:
     try:
         from gateway.control_socket import identify_gateway
@@ -192,6 +204,18 @@ def _probe_host_gateway(wait_for_channel: float) -> Optional[HostGateway]:
     if not hr.liveness_is_proven(record):
         return None
     home = record_home(record)
+    # Self-dial short-circuit (#132547): the record names THIS process — we ARE the host
+    # gateway. Answer ``identify`` locally instead of dialing our own control socket: the
+    # dial's only possible responder is the loop/protocol that serves it, and a caller that
+    # dialed from the gateway's own event loop (the multiplex profile reconcile does) wedges
+    # that responder — on Windows the named-pipe client read has no kernel timeout, so the
+    # stall is unbounded and the shutdown watchdog kills the gateway. The local answer goes
+    # through the same verification as a dialled one, so a mismatch (stale record, recycled
+    # identity) falls through to the bounded dial path unchanged.
+    if record.pid == os.getpid():
+        identity = _local_identify()
+        if _identity_matches(identity, record, home):
+            return HostGateway(record.pid, home, _served_from_identity(identity))
     deadline = time.monotonic() + max(0.0, wait_for_channel)
     while True:
         identity = _identify(home)
