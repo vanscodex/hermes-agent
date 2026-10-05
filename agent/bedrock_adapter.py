@@ -115,14 +115,40 @@ def _require_boto3():
     return boto3
 
 
+def _bedrock_client_config() -> Dict[str, Any]:
+    """boto3 kwargs carrying ``providers.bedrock.request_timeout_seconds`` into botocore.
+
+    Without a ``botocore.config.Config`` botocore applies its own ``read_timeout=60``, which
+    kills a ``converse_stream`` that is still prefilling or thinking at 60s — well inside the
+    patience ``_BedrockStream`` derives for the same call (#133318). The configured value is
+    already honoured for the OpenAI and Anthropic clients; this is the Bedrock client. Clients
+    are cached per region rather than per model, so only the provider-wide key applies here.
+
+    Returns ``{}`` when nothing is configured (or botocore is unavailable), leaving botocore's
+    defaults untouched.
+    """
+    from hermes_cli.timeouts import get_provider_request_timeout
+
+    timeout = get_provider_request_timeout("bedrock")
+    if not timeout:
+        return {}
+    try:
+        from botocore.config import Config
+    except ImportError:  # pragma: no cover — botocore ships with boto3
+        return {}
+    return {"config": Config(read_timeout=timeout)}
+
+
 def _cached_client(cache: Dict[str, Any], service: str, region: str):
     """Get or create a per-region boto3 client. Unscoped: the default credential chain, one client per
     region. Routed profile: one client per (home, service, region), built from that profile's scoped
     ``AWS_*`` (falling back to the default chain only for what the profile does not set)."""
     from hermes_constants import get_hermes_home_override, hermes_home_key
+    config = _bedrock_client_config()
     if get_hermes_home_override() is None:
         if region not in cache:
-            cache[region] = _require_boto3().client(service, region_name=region)
+            cache[region] = _require_boto3().client(
+                service, region_name=region, **config)
         return cache[region]
     key = (hermes_home_key(), service, region)
     client = _bedrock_clients_by_home.get(key)
@@ -130,7 +156,8 @@ def _cached_client(cache: Dict[str, Any], service: str, region: str):
         # Scope check first: a cred-less multiplex profile must hit the ambient-chain
         # refusal, not a boto3 ImportError on hosts that lack the package.
         kwargs = scoped_aws_session_kwargs()
-        client = _require_boto3().Session(**kwargs).client(service, region_name=region)
+        client = _require_boto3().Session(**kwargs).client(
+            service, region_name=region, **config)
         _bedrock_clients_by_home[key] = client
     return client
 
