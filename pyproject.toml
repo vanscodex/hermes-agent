@@ -684,6 +684,24 @@ exclude-newer = "14 days"
 # google-cloud-pubsub: same exact-pin shape (==2.39.2, google-chat adapter).
 # The pin bump WAS the review; exclude-newer only filters it because the
 # 14-day window is younger than the reviewed release.
+#
+# distlib: same shape, one level out — [dependency-groups].test's pin. The lock
+# resolves every group, so an undated cutoff here fails `uv lock` exactly like a
+# runtime pin.
+#
+# pilk, playwright, pyopen-wakeword, pypinyin, resvg-py, tomli-w, truststore:
+# same exact-pin shape, and the last stragglers of it. #126194 reported the
+# `silk` extra's pilk==0.2.4 failing to resolve because their resolver saw no
+# upload date for any pilk file, so uv reads it as newer than the cutoff —
+# the defusedxml/python-olm shape above. Because the lock covers every extra,
+# one unresolved pin fails `uv lock` for all of them, and PM relocks on plugin
+# enable/disable, `pm install`/`pm sync` and every source update. pilk is the
+# extreme case: 0.2.4 has been on PyPI since 2023-05-26, so its exemption
+# carries no aging risk whatsoever.
+#
+# None of this is pilk-specific. Forcing a cutoff in front of any of these pins
+# reproduces the failure verbatim, and uv names whichever pin it reached first,
+# so exempting one just moves the error to the next.
 
 [tool.uv.exclude-newer-package]
 agent-client-protocol = false
@@ -707,6 +725,8 @@ debugpy = false
 defusedxml = false
 dingtalk-stream = false
 discord-py = false
+# dev group, exact-pinned; the cutoff reaches it too, so it needs the same exemption.
+distlib = false
 edge-tts = false
 elevenlabs = false
 exa-py = false
@@ -746,14 +766,18 @@ opentelemetry-sdk = false
 packaging = false
 parallel-web = false
 pathspec = false
+pilk = false
 pillow = false
 piper-tts = "2026-09-04T16:47:32Z"
+playwright = false
 prompt-toolkit = false
 psutil = false
 pvporcupine = false
 pyasn1 = false
 pydantic = false
 pyjwt = false
+pyopen-wakeword = false
+pypinyin = false
 pytest = false
 pytest-asyncio = false
 python-dotenv = false
@@ -763,6 +787,7 @@ python-telegram-bot = false
 pyyaml = false
 qrcode = false
 requests = false
+resvg-py = false
 rich = false
 ruamel-yaml = false
 ruff = false
@@ -780,7 +805,9 @@ sounddevice = false
 soundfile = "2026-06-06T08:58:48Z"
 starlette = false
 tenacity = false
+tomli-w = false
 ty = false
+truststore = false
 tzdata = false
 unpaddedbase64 = false
 uvicorn = false
