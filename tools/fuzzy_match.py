@@ -388,7 +388,9 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
             if drift_err:
                 return content, 0, None, drift_err
 
-        effective_new = _maybe_unescape_new_string(new_string, content, matches)
+        effective_new = _maybe_unescape_new_string(
+            new_string, content, matches, old_string=old_string,
+            strategy_name=strategy_name)
         new_content = _apply_replacements(
             content, matches, effective_new,
             old_string=old_string if strategy_name != "exact" else None,
@@ -502,16 +504,35 @@ def _detect_backslash_doubling(matched_regions: str, old_string: str,
         "as they appear in the file.")
 
 
-def _maybe_unescape_new_string(new_string: str, content: str, matches: list[Span]) -> str:
+def _maybe_unescape_new_string(new_string: str, content: str, matches: list[Span],
+                               old_string: Optional[str] = None,
+                               strategy_name: Optional[str] = None) -> str:
     """Convert literal ``\\t``/``\\r`` in new_string to control chars, per sequence, only
     when the matched region already contains the real control char (so ``sep = "\\t"`` files
-    are left alone). ``\\n`` is excluded: rewriting it would mangle source escape literals."""
+    are left alone). ``\\n`` is excluded: rewriting it would mangle source escape literals.
+
+    Two signals say a literal in new_string is a serialization artifact rather than
+    text the caller meant literally, and each is scoped so they cannot overlap (#130701):
+
+    * ``escape_normalized`` only matched after unescaping old_string, so the caller
+      demonstrably wrote real control chars as escapes; every literal counts.
+    * Otherwise the budget is the number of real control chars the caller *dropped*
+      between old_string and new_string. Indentation is a real tab in every tab-indented
+      file, so "the matched region holds a real tab" alone fires on a deliberate ``'\\t'``
+      rune literal and rewrites it into a raw byte inside the literal (#130701). A caller
+      that carried the real tab over and *also* added a literal meant the literal.
+    """
     if "\\t" not in new_string and "\\r" not in new_string:
         return new_string
     matched_regions = _matched_regions(content, matches)
     for literal, control in (("\\t", "\t"), ("\\r", "\r")):
-        if literal in new_string and control in matched_regions:
-            new_string = new_string.replace(literal, control)
+        if literal not in new_string or control not in matched_regions:
+            continue
+        budget = new_string.count(literal)
+        if strategy_name != "escape_normalized" and old_string is not None:
+            budget = min(budget, max(0, old_string.count(control) - new_string.count(control)))
+        if budget > 0:
+            new_string = new_string.replace(literal, control, budget)
     return new_string
 
 

@@ -624,6 +624,60 @@ class TestEscapeNormalizedNewString:
         assert 'sep = "\\tab"' in new
         assert "\t" not in new
 
+    def test_tab_indented_file_keeps_literal_escape_in_new_string(self):
+        """#130701: the reporter's Go case, verbatim.
+
+        The matched region holds a real tab, but only because it is *indentation*,
+        which is true of every tab-indented file. Unescaping on that signal alone
+        rewrote the deliberate ``'\\t'`` rune literal into a raw control byte, so the
+        Go source no longer compiled.
+        """
+        content = ("package p\n"
+                   "\n"
+                   "func f(r rune) bool {\n"
+                   "\tswitch r {\n"
+                   "\tcase ' ':\n"
+                   "\t\treturn true\n"
+                   "\t}\n"
+                   "\treturn false\n"
+                   "}\n")
+        old_string = "\tcase ' ':"             # real tab (indentation)
+        new_string = "\tcase ' ', '\\t':"     # real tab + a literal escape
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        assert strategy == "exact"
+        # The escape sequence must survive byte for byte — no tab inside the literal.
+        assert "\tcase ' ', '\\t':" in new
+        assert "case ' ', '\t':" not in new
+
+    def test_dropped_real_tab_is_still_unescaped_beside_a_kept_one(self):
+        """#33733 still holds with a mixed new_string: the one real tab the caller
+        dropped is restored, the literal it meant literally is left alone."""
+        content = "\tone\ttwo\n"
+        old_string = "\tone\ttwo\n"           # two real tabs
+        new_string = "one\ttwo\\tthree\n"    # one real tab, one literal escape
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert count == 1
+        assert strategy == "exact"
+        assert new == "one\ttwo\tthree\n"
+
+    def test_escape_normalized_still_unescapes_a_literally_meant_escape(self):
+        """``escape_normalized`` matched only after unescaping old_string, which is
+        direct evidence the caller serialized control chars — the budget never applies.
+        """
+        content = "def hello():\n\tvalue = 1\n"
+        old_string = "def hello():\n\\tvalue = 1\n"     # real newlines, one literal \\t
+        new_string = "def hello():\n\\tvalue = \\t1\n"  # adds a second literal \\t
+        new, count, strategy, err = fuzzy_find_and_replace(
+            content, old_string, new_string)
+        assert err is None, f"Unexpected error: {err}"
+        assert strategy == "escape_normalized"
+        assert new == "def hello():\n\tvalue = \t1\n"
+
     def test_no_escape_sequences_passthrough(self):
         """When new_string has no \\t or \\r, the helper is a no-op."""
         content = "def foo():\n    return 1\n"
